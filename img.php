@@ -5,6 +5,7 @@
  * This script serves image files based on document_id parameter
  * using a CSV file as a mapping database with caching for better performance.
  * Includes support for tracking requests by tags.
+ * Returns 500 error when image is not found.
  */
 
 // Define directory paths
@@ -370,12 +371,12 @@ if (isset($_GET['debug']) && $_GET['debug'] === 'true') {
     exit;
 }
 
-// If no image found, use a placeholder or return 404
+// If no image found, use a placeholder or return 500 error
 if (!$imagePath || !file_exists($imagePath)) {
-    // Return a 404 error
+    // Return a 500 error
     if (!isset($_GET['placeholder']) || $_GET['placeholder'] !== 'true') {
         header('Content-Type: application/json');
-        http_response_code(404);
+        http_response_code(500); // Changed from 404 to 500
         echo json_encode([
             'status' => 'error',
             'message' => 'Image not found for document ID: ' . $id
