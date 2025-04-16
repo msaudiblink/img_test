@@ -1,32 +1,42 @@
 <?php
 /**
- * Image Retrieval Endpoint
+ * Enhanced Image Retrieval Endpoint with CSV Database and Caching
  * 
- * This script serves actual image files based on ID parameter
- * and properly tracks request counts regardless of debug mode.
+ * This script serves image files based on document_id parameter
+ * using a CSV file as a mapping database with caching for better performance.
  */
 
-// Define log directory and ensure it exists with proper permissions
+// Define directory paths
 $logDir = __DIR__ . '/logs';
-if (!file_exists($logDir)) {
-    mkdir($logDir, 0755, true);
+$imagesDir = __DIR__ . '/images';
+$dataDir = __DIR__ . '/data';
+$cacheDir = __DIR__ . '/cache';
+
+// Ensure directories exist
+foreach ([$logDir, $imagesDir, $dataDir, $cacheDir] as $dir) {
+    if (!file_exists($dir)) {
+        mkdir($dir, 0755, true);
+    }
 }
 
-// Define log and counter file paths
+// Define file paths
 $logFile = $logDir . '/request_log.txt';
 $counterFile = $logDir . '/request_counter.json';
+$csvFile = $dataDir . '/document_image_mapping.csv';
+$csvCacheFile = $cacheDir . '/document_image_mapping_cache.php';
 
-// Define images directory (create this and add some images)
-$imagesDir = __DIR__ . '/images';
-if (!file_exists($imagesDir)) {
-    mkdir($imagesDir, 0755, true);
+// Check if CSV file exists
+if (!file_exists($csvFile)) {
+    header('Content-Type: application/json');
+    http_response_code(500);
+    echo json_encode([
+        'status' => 'error',
+        'message' => 'Image mapping database not found'
+    ]);
+    exit;
 }
 
-// Always log key paths
-error_log("Image endpoint using log file: $logFile");
-error_log("Image endpoint using counter file: $counterFile");
-
-// Function to log request to file with error handling
+// Function to log request to file
 function logRequest($id, $logFile) {
     $timestamp = date('Y-m-d H:i:s');
     $ipAddress = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
@@ -44,8 +54,7 @@ function logRequest($id, $logFile) {
     // Create log file if it doesn't exist
     if (!file_exists($logFile)) {
         touch($logFile);
-        chmod($logFile, 0664); // Make writable by web server
-        error_log("Created new log file: $logFile");
+        chmod($logFile, 0664);
     }
     
     // Append to log file with error handling
@@ -54,29 +63,19 @@ function logRequest($id, $logFile) {
     if ($result === false) {
         error_log("Failed to write to log file: $logFile");
         
-        // Try an alternative method if the first fails
+        // Try an alternative method
         $fp = fopen($logFile, 'a');
         if ($fp) {
-            if (flock($fp, LOCK_EX)) {
-                fwrite($fp, $logEntry);
-                flock($fp, LOCK_UN);
-                $result = true;
-                error_log("Successfully wrote log using alternative method");
-            } else {
-                error_log("Could not get lock for alternative write method");
-            }
+            fwrite($fp, $logEntry);
             fclose($fp);
-        } else {
-            error_log("Could not open log file for alternative write method");
+            $result = true;
         }
-    } else {
-        error_log("Successfully logged request for ID: $id");
     }
     
     return $result !== false;
 }
 
-// Function to update and retrieve counter with file locking and error handling
+// Function to update and retrieve counter
 function trackRequestCount($id, $counterFile) {
     // Initialize default data
     $counterData = [
@@ -86,114 +85,28 @@ function trackRequestCount($id, $counterFile) {
     
     // Create counter file if it doesn't exist
     if (!file_exists($counterFile)) {
-        $initResult = file_put_contents($counterFile, json_encode($counterData, JSON_PRETTY_PRINT), LOCK_EX);
-        chmod($counterFile, 0664); // Make writable by web server
-        
-        if ($initResult === false) {
-            error_log("Failed to create counter file: $counterFile");
-        } else {
-            error_log("Created new counter file: $counterFile");
+        file_put_contents($counterFile, json_encode($counterData, JSON_PRETTY_PRINT), LOCK_EX);
+        chmod($counterFile, 0664);
+    }
+    
+    // Read existing counter data
+    $fileContent = file_get_contents($counterFile);
+    if ($fileContent !== false) {
+        $decodedData = json_decode($fileContent, true);
+        if (is_array($decodedData)) {
+            $counterData = $decodedData;
         }
     }
     
-    // Make sure counter file exists and is readable/writable
-    if (!file_exists($counterFile)) {
-        error_log("Counter file doesn't exist after creation attempt: $counterFile");
-        return $counterData;
+    // Update counters
+    $counterData['total']++;
+    if (!isset($counterData['by_id'][$id])) {
+        $counterData['by_id'][$id] = 0;
     }
+    $counterData['by_id'][$id]++;
     
-    if (!is_readable($counterFile)) {
-        error_log("Counter file is not readable: $counterFile");
-        return $counterData;
-    }
-    
-    if (!is_writable($counterFile)) {
-        error_log("Counter file is not writable: $counterFile");
-        return $counterData;
-    }
-    
-    // Read existing counter data with file locking
-    $fp = fopen($counterFile, 'r+');
-    if (!$fp) {
-        error_log("Failed to open counter file: $counterFile");
-        
-        // Try an alternative reading method
-        $existingData = file_get_contents($counterFile);
-        if ($existingData !== false) {
-            $decodedData = json_decode($existingData, true);
-            if (is_array($decodedData)) {
-                $counterData = $decodedData;
-                error_log("Read counter data using alternative method");
-            }
-        }
-        
-        // Update the counters in memory
-        $counterData['total']++;
-        if (!isset($counterData['by_id'][$id])) {
-            $counterData['by_id'][$id] = 0;
-        }
-        $counterData['by_id'][$id]++;
-        
-        // Try to write it back
-        $writeResult = file_put_contents($counterFile, json_encode($counterData, JSON_PRETTY_PRINT), LOCK_EX);
-        if ($writeResult === false) {
-            error_log("Failed to write counter data using alternative method");
-        } else {
-            error_log("Updated counter data using alternative method");
-        }
-        
-        return [
-            'total' => $counterData['total'],
-            'id_count' => $counterData['by_id'][$id]
-        ];
-    }
-    
-    // Acquire exclusive lock
-    if (flock($fp, LOCK_EX)) {
-        $fileContent = '';
-        while (!feof($fp)) {
-            $fileContent .= fread($fp, 8192);
-        }
-        
-        if (!empty($fileContent)) {
-            $decodedData = json_decode($fileContent, true);
-            if (is_array($decodedData)) {
-                $counterData = $decodedData;
-                error_log("Successfully read existing counter data");
-            } else {
-                error_log("Counter file contains invalid JSON, using default data");
-            }
-        } else {
-            error_log("Counter file is empty, using default data");
-        }
-        
-        // Update counters
-        $counterData['total']++;
-        if (!isset($counterData['by_id'][$id])) {
-            $counterData['by_id'][$id] = 0;
-        }
-        $counterData['by_id'][$id]++;
-        
-        // Write updated data back to file
-        ftruncate($fp, 0);
-        rewind($fp);
-        $writeResult = fwrite($fp, json_encode($counterData, JSON_PRETTY_PRINT));
-        
-        if ($writeResult === false) {
-            error_log("Failed to write updated counter data");
-        } else {
-            error_log("Successfully updated counter data");
-        }
-        
-        // Release the lock
-        flock($fp, LOCK_UN);
-    } else {
-        error_log("Could not acquire lock for counter file");
-    }
-    
-    fclose($fp);
-    
-    error_log("Counter stats: total=" . $counterData['total'] . ", id_count=" . $counterData['by_id'][$id]);
+    // Save updated counter data
+    file_put_contents($counterFile, json_encode($counterData, JSON_PRETTY_PRINT), LOCK_EX);
     
     return [
         'total' => $counterData['total'],
@@ -201,28 +114,110 @@ function trackRequestCount($id, $counterFile) {
     ];
 }
 
-// Function to get image path from ID
-function getImagePath($id, $imagesDir) {
-    // Map ID to an actual image file
-    // This is where you would implement your logic to find the correct image
-    // For now, we'll use a simple approach
+// Function to build or get CSV cache
+function buildOrGetCSVCache($csvFile, $csvCacheFile) {
+    $rebuildCache = false;
     
-    // Option 1: If you're using the ID as the filename
-    $directFile = $imagesDir . '/' . $id . '.jpg';
-    if (file_exists($directFile)) {
-        return $directFile;
+    // Check if cache exists and is newer than CSV
+    if (file_exists($csvCacheFile)) {
+        $csvModified = filemtime($csvFile);
+        $cacheModified = filemtime($csvCacheFile);
+        
+        if ($csvModified > $cacheModified) {
+            $rebuildCache = true;
+        }
+    } else {
+        $rebuildCache = true;
     }
     
-    // Option 2: If you have a mapping system or database
-    // This would be where you query your database to get the filename
-    
-    // Option 3: Return a default image if no matching image is found
-    $defaultImage = $imagesDir . '/default.jpg';
-    if (file_exists($defaultImage)) {
-        return $defaultImage;
+    // If we need to rebuild the cache
+    if ($rebuildCache) {
+        // Read CSV file
+        $handle = fopen($csvFile, 'r');
+        if (!$handle) {
+            error_log("Failed to open CSV file: $csvFile");
+            return null;
+        }
+        
+        // Read header row
+        $header = fgetcsv($handle);
+        if (!$header) {
+            fclose($handle);
+            error_log("Failed to read CSV header");
+            return null;
+        }
+        
+        // Find column indices
+        $docIdIndex = array_search('document_id', $header);
+        $imagePathIndex = array_search('image_path', $header);
+        
+        if ($docIdIndex === false || $imagePathIndex === false) {
+            fclose($handle);
+            error_log("CSV is missing required columns (document_id or image_path)");
+            return null;
+        }
+        
+        // Build mapping cache
+        $mappingCache = [];
+        while (($row = fgetcsv($handle)) !== false) {
+            if (isset($row[$docIdIndex]) && isset($row[$imagePathIndex]) && 
+                !empty($row[$docIdIndex]) && !empty($row[$imagePathIndex])) {
+                $mappingCache[$row[$docIdIndex]] = $row[$imagePathIndex];
+            }
+        }
+        
+        fclose($handle);
+        
+        // Save cache to PHP file for fast loading
+        $cacheContent = "<?php\nreturn " . var_export($mappingCache, true) . ";\n";
+        file_put_contents($csvCacheFile, $cacheContent, LOCK_EX);
+        chmod($csvCacheFile, 0644);
+        
+        return $mappingCache;
+    } else {
+        // Load existing cache
+        return include($csvCacheFile);
+    }
+}
+
+// Function to get image path from document ID using cached CSV mapping
+function getImagePathFromCache($documentId, $mapping, $imagesDir) {
+    // Check if document ID exists in the mapping
+    if (!isset($mapping[$documentId])) {
+        error_log("No image path found for document ID: $documentId");
+        return null;
     }
     
-    // Option 4: Use a placeholder service if no image exists
+    $imagePath = $mapping[$documentId];
+    
+    // Determine the full image path
+    // If the image path is a full path, use it directly
+    if (file_exists($imagePath)) {
+        return $imagePath;
+    }
+    
+    // If it's a relative path, combine with the images directory
+    $fullPath = $imagesDir . '/' . $imagePath;
+    if (file_exists($fullPath)) {
+        return $fullPath;
+    }
+    
+    // If it's just a filename, check in images directory
+    $filenameOnly = basename($imagePath);
+    $fileInImagesDir = $imagesDir . '/' . $filenameOnly;
+    if (file_exists($fileInImagesDir)) {
+        return $fileInImagesDir;
+    }
+    
+    // Try to find the file without caring about case sensitivity
+    $files = scandir($imagesDir);
+    foreach ($files as $file) {
+        if (strtolower($file) === strtolower($filenameOnly)) {
+            return $imagesDir . '/' . $file;
+        }
+    }
+    
+    error_log("Image file does not exist: $imagePath or $fullPath");
     return null;
 }
 
@@ -240,14 +235,22 @@ if ($id === null) {
     exit;
 }
 
-// Log the request - this should work regardless of debug parameter
-$logSuccess = logRequest($id, $logFile);
+// Log the request
+logRequest($id, $logFile);
 
-// Track request count - this should work regardless of debug parameter
+// Track request count
 $countStats = trackRequestCount($id, $counterFile);
 
-// Get the image path
-$imagePath = getImagePath($id, $imagesDir);
+// Get CSV mapping (cached for performance)
+$startTime = microtime(true);
+$mapping = buildOrGetCSVCache($csvFile, $csvCacheFile);
+$cacheTime = microtime(true) - $startTime;
+
+// Get the image path from cache
+$imagePath = null;
+if ($mapping) {
+    $imagePath = getImagePathFromCache($id, $mapping, $imagesDir);
+}
 
 // If debug mode is enabled, return info instead of image
 if (isset($_GET['debug']) && $_GET['debug'] === 'true') {
@@ -257,37 +260,33 @@ if (isset($_GET['debug']) && $_GET['debug'] === 'true') {
         'id' => $id,
         'image_path' => $imagePath,
         'file_exists' => $imagePath ? file_exists($imagePath) : false,
-        'log_success' => $logSuccess,
         'count_stats' => $countStats,
-        'log_file' => $logFile,
-        'counter_file' => $counterFile,
-        'counter_file_exists' => file_exists($counterFile),
-        'counter_file_readable' => is_readable($counterFile),
-        'counter_file_writable' => is_writable($counterFile),
-        'php_user' => posix_getpwuid(posix_geteuid())['name'] ?? 'unknown'
+        'csv_file' => $csvFile,
+        'csv_cache_file' => $csvCacheFile,
+        'cache_time_ms' => round($cacheTime * 1000, 2),
+        'mapping_size' => $mapping ? count($mapping) : 0,
+        'cache_exists' => file_exists($csvCacheFile)
     ]);
     exit;
 }
 
 // If no image found, use a placeholder or return 404
 if (!$imagePath || !file_exists($imagePath)) {
-    // Option 1: Return a 404 error
+    // Return a 404 error
     if (!isset($_GET['placeholder']) || $_GET['placeholder'] !== 'true') {
         header('Content-Type: application/json');
         http_response_code(404);
         echo json_encode([
             'status' => 'error',
-            'message' => 'Image not found',
-            'tracking_successful' => $logSuccess
+            'message' => 'Image not found for document ID: ' . $id
         ]);
         exit;
     }
     
-    // Option 2: Use a placeholder service
-    // Redirect to a placeholder image service
+    // Use a placeholder service
     $width = $_GET['width'] ?? 300;
     $height = $_GET['height'] ?? 300;
-    header('Location: https://via.placeholder.com/' . $width . 'x' . $height);
+    header('Location: https://via.placeholder.com/' . $width . 'x' . $height . '?text=No+Image+For+' . urlencode($id));
     exit;
 }
 
