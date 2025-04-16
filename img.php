@@ -1,9 +1,10 @@
 <?php
 /**
- * Enhanced Image Retrieval Endpoint with CSV Database and Caching
+ * Enhanced Image Retrieval Endpoint with CSV Database, Caching and Reset Option
  * 
  * This script serves image files based on document_id parameter
  * using a CSV file as a mapping database with caching for better performance.
+ * Includes an option to reset the cache via a URL parameter.
  */
 
 // Define directory paths
@@ -24,6 +25,13 @@ $logFile = $logDir . '/request_log.txt';
 $counterFile = $logDir . '/request_counter.json';
 $csvFile = $dataDir . '/document_image_mapping.csv';
 $csvCacheFile = $cacheDir . '/document_image_mapping_cache.php';
+
+// Check for cache reset request
+$resetCache = isset($_GET['reset_cache']) && $_GET['reset_cache'] === 'true';
+if ($resetCache && file_exists($csvCacheFile)) {
+    unlink($csvCacheFile);
+    error_log("Cache file reset: $csvCacheFile");
+}
 
 // Check if CSV file exists
 if (!file_exists($csvFile)) {
@@ -115,23 +123,28 @@ function trackRequestCount($id, $counterFile) {
 }
 
 // Function to build or get CSV cache
-function buildOrGetCSVCache($csvFile, $csvCacheFile) {
-    $rebuildCache = false;
+function buildOrGetCSVCache($csvFile, $csvCacheFile, $forceRebuild = false) {
+    $rebuildCache = $forceRebuild;
     
     // Check if cache exists and is newer than CSV
-    if (file_exists($csvCacheFile)) {
+    if (!$rebuildCache && file_exists($csvCacheFile)) {
         $csvModified = filemtime($csvFile);
         $cacheModified = filemtime($csvCacheFile);
         
         if ($csvModified > $cacheModified) {
             $rebuildCache = true;
+            error_log("Rebuilding cache because CSV file is newer than cache");
         }
-    } else {
+    } else if (!file_exists($csvCacheFile)) {
         $rebuildCache = true;
+        error_log("Rebuilding cache because cache file doesn't exist");
     }
     
     // If we need to rebuild the cache
     if ($rebuildCache) {
+        $startTime = microtime(true);
+        error_log("Starting cache rebuild from CSV");
+        
         // Read CSV file
         $handle = fopen($csvFile, 'r');
         if (!$handle) {
@@ -159,7 +172,9 @@ function buildOrGetCSVCache($csvFile, $csvCacheFile) {
         
         // Build mapping cache
         $mappingCache = [];
+        $rowCount = 0;
         while (($row = fgetcsv($handle)) !== false) {
+            $rowCount++;
             if (isset($row[$docIdIndex]) && isset($row[$imagePathIndex]) && 
                 !empty($row[$docIdIndex]) && !empty($row[$imagePathIndex])) {
                 $mappingCache[$row[$docIdIndex]] = $row[$imagePathIndex];
@@ -169,14 +184,23 @@ function buildOrGetCSVCache($csvFile, $csvCacheFile) {
         fclose($handle);
         
         // Save cache to PHP file for fast loading
-        $cacheContent = "<?php\nreturn " . var_export($mappingCache, true) . ";\n";
+        $cacheContent = "<?php\n// Generated " . date('Y-m-d H:i:s') . " from $csvFile\n// Contains " . count($mappingCache) . " mappings\nreturn " . var_export($mappingCache, true) . ";\n";
         file_put_contents($csvCacheFile, $cacheContent, LOCK_EX);
         chmod($csvCacheFile, 0644);
+        
+        $endTime = microtime(true);
+        $duration = round(($endTime - $startTime) * 1000, 2);
+        error_log("Cache rebuild complete. Processed $rowCount rows into " . count($mappingCache) . " mappings in {$duration}ms");
         
         return $mappingCache;
     } else {
         // Load existing cache
-        return include($csvCacheFile);
+        $startTime = microtime(true);
+        $mapping = include($csvCacheFile);
+        $endTime = microtime(true);
+        $duration = round(($endTime - $startTime) * 1000, 2);
+        error_log("Loaded existing cache with " . count($mapping) . " mappings in {$duration}ms");
+        return $mapping;
     }
 }
 
@@ -224,6 +248,44 @@ function getImagePathFromCache($documentId, $mapping, $imagesDir) {
 // Check if ID parameter is provided
 $id = $_GET['id'] ?? null;
 
+// Handle cache info request
+if (isset($_GET['cache_info']) && $_GET['cache_info'] === 'true') {
+    header('Content-Type: application/json');
+    
+    $cacheInfo = [
+        'status' => 'success',
+        'csv_file' => $csvFile,
+        'csv_file_exists' => file_exists($csvFile),
+        'csv_file_size' => file_exists($csvFile) ? filesize($csvFile) : null,
+        'csv_file_modified' => file_exists($csvFile) ? date('Y-m-d H:i:s', filemtime($csvFile)) : null,
+        'cache_file' => $csvCacheFile,
+        'cache_file_exists' => file_exists($csvCacheFile),
+        'cache_file_size' => file_exists($csvCacheFile) ? filesize($csvCacheFile) : null,
+        'cache_file_modified' => file_exists($csvCacheFile) ? date('Y-m-d H:i:s', filemtime($csvCacheFile)) : null,
+    ];
+    
+    // Load cache to get entry count if it exists
+    if (file_exists($csvCacheFile)) {
+        $mapping = include($csvCacheFile);
+        $cacheInfo['mapping_entries'] = count($mapping);
+    }
+    
+    echo json_encode($cacheInfo, JSON_PRETTY_PRINT);
+    exit;
+}
+
+// If this is just a cache reset request, return success message
+if ($resetCache && !$id) {
+    header('Content-Type: application/json');
+    echo json_encode([
+        'status' => 'success',
+        'message' => 'Cache has been reset. It will be rebuilt on the next request.',
+        'cache_file' => $csvCacheFile,
+        'cache_file_exists' => file_exists($csvCacheFile)
+    ]);
+    exit;
+}
+
 if ($id === null) {
     // Return error if no ID provided
     header('Content-Type: application/json');
@@ -243,7 +305,7 @@ $countStats = trackRequestCount($id, $counterFile);
 
 // Get CSV mapping (cached for performance)
 $startTime = microtime(true);
-$mapping = buildOrGetCSVCache($csvFile, $csvCacheFile);
+$mapping = buildOrGetCSVCache($csvFile, $csvCacheFile, $resetCache);
 $cacheTime = microtime(true) - $startTime;
 
 // Get the image path from cache
@@ -265,7 +327,8 @@ if (isset($_GET['debug']) && $_GET['debug'] === 'true') {
         'csv_cache_file' => $csvCacheFile,
         'cache_time_ms' => round($cacheTime * 1000, 2),
         'mapping_size' => $mapping ? count($mapping) : 0,
-        'cache_exists' => file_exists($csvCacheFile)
+        'cache_exists' => file_exists($csvCacheFile),
+        'cache_was_reset' => $resetCache
     ]);
     exit;
 }
