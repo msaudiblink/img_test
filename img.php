@@ -1,10 +1,10 @@
 <?php
 /**
- * Enhanced Image Retrieval Endpoint with CSV Database, Caching and Reset Option
+ * Enhanced Image Retrieval Endpoint with Tag Support
  * 
  * This script serves image files based on document_id parameter
  * using a CSV file as a mapping database with caching for better performance.
- * Includes an option to reset the cache via a URL parameter.
+ * Includes support for tracking requests by tags.
  */
 
 // Define directory paths
@@ -44,17 +44,18 @@ if (!file_exists($csvFile)) {
     exit;
 }
 
-// Function to log request to file
-function logRequest($id, $logFile) {
+// Function to log request to file with tag support
+function logRequest($id, $tag, $logFile) {
     $timestamp = date('Y-m-d H:i:s');
     $ipAddress = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
     $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? 'unknown';
     
-    // Format log entry
+    // Format log entry with tag
     $logEntry = sprintf(
-        "[%s] ID: %s | IP: %s | User-Agent: %s\n",
+        "[%s] ID: %s | Tag: %s | IP: %s | User-Agent: %s\n",
         $timestamp,
         $id,
+        $tag,
         $ipAddress,
         $userAgent
     );
@@ -83,12 +84,13 @@ function logRequest($id, $logFile) {
     return $result !== false;
 }
 
-// Function to update and retrieve counter
-function trackRequestCount($id, $counterFile) {
+// Function to update and retrieve counter with tag support
+function trackRequestCount($id, $tag, $counterFile) {
     // Initialize default data
     $counterData = [
         'total' => 0,
-        'by_id' => []
+        'by_id' => [],
+        'by_tag' => []
     ];
     
     // Create counter file if it doesn't exist
@@ -103,23 +105,56 @@ function trackRequestCount($id, $counterFile) {
         $decodedData = json_decode($fileContent, true);
         if (is_array($decodedData)) {
             $counterData = $decodedData;
+            
+            // Make sure by_tag exists (for backward compatibility)
+            if (!isset($counterData['by_tag'])) {
+                $counterData['by_tag'] = [];
+            }
         }
     }
     
-    // Update counters
+    // Update total counter
     $counterData['total']++;
+    
+    // Update ID counter
     if (!isset($counterData['by_id'][$id])) {
         $counterData['by_id'][$id] = 0;
     }
     $counterData['by_id'][$id]++;
     
+    // Update tag counter
+    if (!empty($tag)) {
+        if (!isset($counterData['by_tag'][$tag])) {
+            $counterData['by_tag'][$tag] = [
+                'total' => 0,
+                'by_id' => []
+            ];
+        }
+        
+        $counterData['by_tag'][$tag]['total']++;
+        
+        if (!isset($counterData['by_tag'][$tag]['by_id'][$id])) {
+            $counterData['by_tag'][$tag]['by_id'][$id] = 0;
+        }
+        $counterData['by_tag'][$tag]['by_id'][$id]++;
+    }
+    
     // Save updated counter data
     file_put_contents($counterFile, json_encode($counterData, JSON_PRETTY_PRINT), LOCK_EX);
     
-    return [
+    // Return stats specific to this request
+    $result = [
         'total' => $counterData['total'],
         'id_count' => $counterData['by_id'][$id]
     ];
+    
+    if (!empty($tag)) {
+        $result['tag'] = $tag;
+        $result['tag_total'] = $counterData['by_tag'][$tag]['total'];
+        $result['tag_id_count'] = $counterData['by_tag'][$tag]['by_id'][$id];
+    }
+    
+    return $result;
 }
 
 // Function to build or get CSV cache
@@ -247,6 +282,7 @@ function getImagePathFromCache($documentId, $mapping, $imagesDir) {
 
 // Check if ID parameter is provided
 $id = $_GET['id'] ?? null;
+$tag = $_GET['tag'] ?? '';
 
 // Handle cache info request
 if (isset($_GET['cache_info']) && $_GET['cache_info'] === 'true') {
@@ -297,11 +333,11 @@ if ($id === null) {
     exit;
 }
 
-// Log the request
-logRequest($id, $logFile);
+// Log the request with tag
+logRequest($id, $tag, $logFile);
 
-// Track request count
-$countStats = trackRequestCount($id, $counterFile);
+// Track request count with tag
+$countStats = trackRequestCount($id, $tag, $counterFile);
 
 // Get CSV mapping (cached for performance)
 $startTime = microtime(true);
@@ -320,6 +356,7 @@ if (isset($_GET['debug']) && $_GET['debug'] === 'true') {
     echo json_encode([
         'status' => 'debug',
         'id' => $id,
+        'tag' => $tag,
         'image_path' => $imagePath,
         'file_exists' => $imagePath ? file_exists($imagePath) : false,
         'count_stats' => $countStats,
