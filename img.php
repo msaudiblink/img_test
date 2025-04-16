@@ -3,7 +3,7 @@
  * Image Retrieval Endpoint
  * 
  * This script serves actual image files based on ID parameter
- * and tracks request counts.
+ * and properly tracks request counts regardless of debug mode.
  */
 
 // Define log directory and ensure it exists with proper permissions
@@ -12,7 +12,7 @@ if (!file_exists($logDir)) {
     mkdir($logDir, 0755, true);
 }
 
-// Define log and counter file paths with ABSOLUTE paths
+// Define log and counter file paths
 $logFile = $logDir . '/request_log.txt';
 $counterFile = $logDir . '/request_counter.json';
 
@@ -21,6 +21,10 @@ $imagesDir = __DIR__ . '/images';
 if (!file_exists($imagesDir)) {
     mkdir($imagesDir, 0755, true);
 }
+
+// Always log key paths
+error_log("Image endpoint using log file: $logFile");
+error_log("Image endpoint using counter file: $counterFile");
 
 // Function to log request to file with error handling
 function logRequest($id, $logFile) {
@@ -41,6 +45,7 @@ function logRequest($id, $logFile) {
     if (!file_exists($logFile)) {
         touch($logFile);
         chmod($logFile, 0664); // Make writable by web server
+        error_log("Created new log file: $logFile");
     }
     
     // Append to log file with error handling
@@ -48,6 +53,24 @@ function logRequest($id, $logFile) {
     
     if ($result === false) {
         error_log("Failed to write to log file: $logFile");
+        
+        // Try an alternative method if the first fails
+        $fp = fopen($logFile, 'a');
+        if ($fp) {
+            if (flock($fp, LOCK_EX)) {
+                fwrite($fp, $logEntry);
+                flock($fp, LOCK_UN);
+                $result = true;
+                error_log("Successfully wrote log using alternative method");
+            } else {
+                error_log("Could not get lock for alternative write method");
+            }
+            fclose($fp);
+        } else {
+            error_log("Could not open log file for alternative write method");
+        }
+    } else {
+        error_log("Successfully logged request for ID: $id");
     }
     
     return $result !== false;
@@ -63,44 +86,114 @@ function trackRequestCount($id, $counterFile) {
     
     // Create counter file if it doesn't exist
     if (!file_exists($counterFile)) {
-        file_put_contents($counterFile, json_encode($counterData, JSON_PRETTY_PRINT), LOCK_EX);
+        $initResult = file_put_contents($counterFile, json_encode($counterData, JSON_PRETTY_PRINT), LOCK_EX);
         chmod($counterFile, 0664); // Make writable by web server
+        
+        if ($initResult === false) {
+            error_log("Failed to create counter file: $counterFile");
+        } else {
+            error_log("Created new counter file: $counterFile");
+        }
+    }
+    
+    // Make sure counter file exists and is readable/writable
+    if (!file_exists($counterFile)) {
+        error_log("Counter file doesn't exist after creation attempt: $counterFile");
+        return $counterData;
+    }
+    
+    if (!is_readable($counterFile)) {
+        error_log("Counter file is not readable: $counterFile");
+        return $counterData;
+    }
+    
+    if (!is_writable($counterFile)) {
+        error_log("Counter file is not writable: $counterFile");
+        return $counterData;
     }
     
     // Read existing counter data with file locking
     $fp = fopen($counterFile, 'r+');
-    if ($fp) {
-        // Acquire exclusive lock
-        if (flock($fp, LOCK_EX)) {
-            $fileContent = '';
-            while (!feof($fp)) {
-                $fileContent .= fread($fp, 8192);
+    if (!$fp) {
+        error_log("Failed to open counter file: $counterFile");
+        
+        // Try an alternative reading method
+        $existingData = file_get_contents($counterFile);
+        if ($existingData !== false) {
+            $decodedData = json_decode($existingData, true);
+            if (is_array($decodedData)) {
+                $counterData = $decodedData;
+                error_log("Read counter data using alternative method");
             }
-            
-            if (!empty($fileContent)) {
-                $decodedData = json_decode($fileContent, true);
-                if (is_array($decodedData)) {
-                    $counterData = $decodedData;
-                }
-            }
-            
-            // Update counters
-            $counterData['total']++;
-            if (!isset($counterData['by_id'][$id])) {
-                $counterData['by_id'][$id] = 0;
-            }
-            $counterData['by_id'][$id]++;
-            
-            // Write updated data back to file
-            ftruncate($fp, 0);
-            rewind($fp);
-            fwrite($fp, json_encode($counterData, JSON_PRETTY_PRINT));
-            
-            // Release the lock
-            flock($fp, LOCK_UN);
         }
-        fclose($fp);
+        
+        // Update the counters in memory
+        $counterData['total']++;
+        if (!isset($counterData['by_id'][$id])) {
+            $counterData['by_id'][$id] = 0;
+        }
+        $counterData['by_id'][$id]++;
+        
+        // Try to write it back
+        $writeResult = file_put_contents($counterFile, json_encode($counterData, JSON_PRETTY_PRINT), LOCK_EX);
+        if ($writeResult === false) {
+            error_log("Failed to write counter data using alternative method");
+        } else {
+            error_log("Updated counter data using alternative method");
+        }
+        
+        return [
+            'total' => $counterData['total'],
+            'id_count' => $counterData['by_id'][$id]
+        ];
     }
+    
+    // Acquire exclusive lock
+    if (flock($fp, LOCK_EX)) {
+        $fileContent = '';
+        while (!feof($fp)) {
+            $fileContent .= fread($fp, 8192);
+        }
+        
+        if (!empty($fileContent)) {
+            $decodedData = json_decode($fileContent, true);
+            if (is_array($decodedData)) {
+                $counterData = $decodedData;
+                error_log("Successfully read existing counter data");
+            } else {
+                error_log("Counter file contains invalid JSON, using default data");
+            }
+        } else {
+            error_log("Counter file is empty, using default data");
+        }
+        
+        // Update counters
+        $counterData['total']++;
+        if (!isset($counterData['by_id'][$id])) {
+            $counterData['by_id'][$id] = 0;
+        }
+        $counterData['by_id'][$id]++;
+        
+        // Write updated data back to file
+        ftruncate($fp, 0);
+        rewind($fp);
+        $writeResult = fwrite($fp, json_encode($counterData, JSON_PRETTY_PRINT));
+        
+        if ($writeResult === false) {
+            error_log("Failed to write updated counter data");
+        } else {
+            error_log("Successfully updated counter data");
+        }
+        
+        // Release the lock
+        flock($fp, LOCK_UN);
+    } else {
+        error_log("Could not acquire lock for counter file");
+    }
+    
+    fclose($fp);
+    
+    error_log("Counter stats: total=" . $counterData['total'] . ", id_count=" . $counterData['by_id'][$id]);
     
     return [
         'total' => $counterData['total'],
@@ -147,18 +240,11 @@ if ($id === null) {
     exit;
 }
 
-// Debug logging to track what's happening
-error_log("Processing request for ID: $id");
-error_log("Log file path: $logFile");
-error_log("Counter file path: $counterFile");
-
-// Log the request
+// Log the request - this should work regardless of debug parameter
 $logSuccess = logRequest($id, $logFile);
-error_log("Log success: " . ($logSuccess ? 'true' : 'false'));
 
-// Track request count
+// Track request count - this should work regardless of debug parameter
 $countStats = trackRequestCount($id, $counterFile);
-error_log("Counter stats: " . json_encode($countStats));
 
 // Get the image path
 $imagePath = getImagePath($id, $imagesDir);
@@ -175,6 +261,9 @@ if (isset($_GET['debug']) && $_GET['debug'] === 'true') {
         'count_stats' => $countStats,
         'log_file' => $logFile,
         'counter_file' => $counterFile,
+        'counter_file_exists' => file_exists($counterFile),
+        'counter_file_readable' => is_readable($counterFile),
+        'counter_file_writable' => is_writable($counterFile),
         'php_user' => posix_getpwuid(posix_geteuid())['name'] ?? 'unknown'
     ]);
     exit;
