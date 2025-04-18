@@ -28,7 +28,7 @@ $csvFile = $dataDir . '/document_image_mapping.csv';
 $csvCacheFile = $cacheDir . '/document_image_mapping_cache.php';
 
 // Define default image path - adjust this path as needed
-$defaultImagePath = $imagesDir . '/default.png';
+$defaultImagePath = $imagesDir . '/default.jpeg';
 
 // Check for cache reset request
 $resetCache = isset($_GET['reset_cache']) && $_GET['reset_cache'] === 'true';
